@@ -1,0 +1,70 @@
+# Loki en modo "single binary" con los logs guardados en Azure Blob Storage.
+#
+#  - Los chunks (contenido de los logs) y el índice se suben al contenedor
+#    de Blob indicado en AZURE_CONTAINER.
+#  - En el disco local (/loki) solo queda lo temporal: el WAL (para no perder
+#    logs si Loki se reinicia antes de subirlos), cachés y el compactador.
+#
+# Las variables entre llaves con signo de dólar se toman del entorno
+# (Loki arranca con -config.expand-env=true). Ver reporteria/.env
+# OJO: no escribas esa sintaxis en comentarios; Loki también la procesa.
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+  storage:
+    azure:
+      # Sirve para Azurite y para Azure real; solo cambia la cadena.
+      connection_string: "${AZURE_STORAGE_CONNECTION_STRING}"
+      container_name: "${AZURE_CONTAINER:-loki-logs}"
+      request_timeout: 30s
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: azure
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+ingester:
+  # Sube un bloque de logs al Blob tras 5 minutos sin líneas nuevas,
+  # o como máximo cada hora aunque sigan llegando.
+  chunk_idle_period: 5m
+  max_chunk_age: 1h
+
+limits_config:
+  # Cuánto tiempo se conservan los logs (720h = 30 días)
+  retention_period: 720h
+  max_query_lookback: 720h
+  volume_enabled: true
+
+compactor:
+  working_directory: /loki/compactor
+  compaction_interval: 10m
+  retention_enabled: true
+  retention_delete_delay: 2h
+  delete_request_store: azure
+
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 100
+
+analytics:
+  reporting_enabled: false

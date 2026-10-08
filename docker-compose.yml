@@ -1,0 +1,198 @@
+# =============================================================================
+#  WAF con BunkerWeb + envío de logs a la reportería (Loki/Grafana)
+# =============================================================================
+#
+#  Flujo del tráfico:   Internet -> BunkerWeb (80/443) -> app (red interna)
+#  Flujo de los logs:   BunkerWeb (stdout) -> driver "fluentd" de Docker
+#                       -> Fluent Bit -> Loki (reporteria/) -> Azure Blob
+#
+#  ORDEN DE ARRANQUE: primero reporteria/ (crea la red waf-logs), luego este.
+#
+#  Toda la configuración variable está en el archivo .env
+# =============================================================================
+
+x-bw-api-env: &bw-api-env
+  # Debe ser idéntico en bunkerweb y bw-scheduler
+  API_WHITELIST_IP: "127.0.0.0/8 10.20.30.0/24"
+
+# Base de datos compartida por el scheduler y la interfaz web
+x-bw-db-env: &bw-db-env
+  DATABASE_URI: "mariadb+pymysql://bunkerweb:${BW_DB_PASSWORD}@bw-db:3306/db"
+
+# Envía la salida del contenedor a Fluent Bit.
+# fluentd-async: el contenedor arranca aunque Fluent Bit aún no esté listo.
+x-logging-fluentbit: &logging-fluentbit
+  driver: fluentd
+  options:
+    fluentd-address: "127.0.0.1:24224"
+    fluentd-async: "true"
+    tag: "docker.{{.Name}}"
+
+services:
+  # ---------------------------------------------------------------------------
+  # WAF: BunkerWeb (NGINX + ModSecurity + OWASP CRS)
+  # ---------------------------------------------------------------------------
+  bunkerweb:
+    image: bunkerity/bunkerweb:${BUNKERWEB_VERSION}
+    container_name: waf-bunkerweb
+    ports:
+      - "80:8080/tcp"
+      - "443:8443/tcp"
+      - "443:8443/udp"   # QUIC / HTTP3
+    environment:
+      <<: *bw-api-env
+    depends_on:
+      - fluent-bit
+    logging: *logging-fluentbit
+    restart: unless-stopped
+    networks:
+      - bw-universe
+      - bw-services
+
+  # El scheduler es donde se definen TODOS los ajustes de BunkerWeb.
+  # Él genera la configuración y se la envía al contenedor bunkerweb.
+  bw-scheduler:
+    image: bunkerity/bunkerweb-scheduler:${BUNKERWEB_VERSION}
+    container_name: waf-scheduler
+    depends_on:
+      - bunkerweb
+      - bw-db
+    environment:
+      <<: [*bw-api-env, *bw-db-env]
+      BUNKERWEB_INSTANCES: "bunkerweb"
+      TZ: "${TZ}"
+
+      # --- Sitio protegido ---------------------------------------------------
+      SERVER_NAME: "${APP_DOMAIN}"
+      USE_REVERSE_PROXY: "yes"
+      REVERSE_PROXY_URL: "/"
+      REVERSE_PROXY_HOST: "${APP_UPSTREAM}"
+
+      # --- HTTPS -------------------------------------------------------------
+      AUTO_LETS_ENCRYPT: "${AUTO_LETS_ENCRYPT}"
+      EMAIL_LETS_ENCRYPT: "${EMAIL_LETS_ENCRYPT}"
+      GENERATE_SELF_SIGNED_SSL: "${GENERATE_SELF_SIGNED_SSL}"
+
+      # --- WAF ---------------------------------------------------------------
+      # detect = solo registra | block = registra y bloquea
+      SECURITY_MODE: "${SECURITY_MODE}"
+      USE_MODSECURITY: "yes"
+      USE_MODSECURITY_CRS: "yes"
+
+      # --- Protecciones adicionales -----------------------------------------
+      USE_BAD_BEHAVIOR: "yes"
+      # Ban corto para el prototipo: si lanzas muchas pruebas de ataque
+      # desde tu IP, quedarás bloqueado solo este tiempo (segundos).
+      BAD_BEHAVIOR_BAN_TIME: "${BAD_BEHAVIOR_BAN_TIME}"
+      USE_LIMIT_REQ: "yes"
+      USE_BLACKLIST: "yes"
+
+      # --- Logs --------------------------------------------------------------
+      LOG_LEVEL: "notice"
+    volumes:
+      - bw-storage:/data
+    logging: *logging-fluentbit
+    restart: unless-stopped
+    networks:
+      - bw-universe
+      - bw-db
+
+  # ---------------------------------------------------------------------------
+  # Interfaz web de BunkerWeb (servicios, ajustes, baneos, estado)
+  # Solo en localhost, igual que Grafana. Ver README para acceder desde
+  # otro equipo.
+  # ---------------------------------------------------------------------------
+  bw-ui:
+    image: bunkerity/bunkerweb-ui:${BUNKERWEB_VERSION}
+    container_name: waf-ui
+    ports:
+      - "127.0.0.1:7000:7000"
+    depends_on:
+      - bw-db
+      - bw-scheduler
+    environment:
+      <<: *bw-db-env
+      TZ: "${TZ}"
+      # Crea el usuario administrador y omite el asistente de instalación
+      ADMIN_USERNAME: "${BW_UI_ADMIN_USER}"
+      ADMIN_PASSWORD: "${BW_UI_ADMIN_PASSWORD}"
+    volumes:
+      # Claves de sesión y de 2FA de la interfaz
+      - bw-ui-data:/data
+    logging: *logging-fluentbit
+    restart: unless-stopped
+    networks:
+      - bw-universe
+      - bw-db
+
+  # ---------------------------------------------------------------------------
+  # Base de datos de BunkerWeb (configuración, usuarios de la interfaz).
+  # NO guarda los logs: esos van a Loki.
+  # ---------------------------------------------------------------------------
+  bw-db:
+    image: mariadb:${MARIADB_VERSION}
+    container_name: waf-db
+    command: --max-allowed-packet=67108864
+    environment:
+      MYSQL_RANDOM_ROOT_PASSWORD: "yes"
+      MYSQL_DATABASE: "db"
+      MYSQL_USER: "bunkerweb"
+      MYSQL_PASSWORD: "${BW_DB_PASSWORD}"
+    volumes:
+      - bw-db-data:/var/lib/mysql
+    restart: unless-stopped
+    networks:
+      - bw-db
+
+  # ---------------------------------------------------------------------------
+  # Tu aplicación (aquí una app de demostración que responde con los datos de
+  # la petición). Cámbiala por la tuya. NO publica puertos: solo es
+  # accesible a través de BunkerWeb.
+  # ---------------------------------------------------------------------------
+  app:
+    image: traefik/whoami:v1.10
+    container_name: waf-app
+    restart: unless-stopped
+    networks:
+      - bw-services
+
+  # ---------------------------------------------------------------------------
+  # Recolector de logs: recibe la salida de BunkerWeb y la envía a Loki
+  # (Loki está en el stack de reportería: carpeta reporteria/)
+  # ---------------------------------------------------------------------------
+  fluent-bit:
+    image: fluent/fluent-bit:${FLUENTBIT_VERSION}
+    container_name: waf-fluent-bit
+    ports:
+      # Solo en localhost: el driver de Docker del host se conecta aquí.
+      - "127.0.0.1:24224:24224/tcp"
+    environment:
+      LOKI_HOST: "${LOKI_HOST}"
+      LOKI_PORT: "${LOKI_PORT}"
+    volumes:
+      - ./fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ./fluent-bit/clasificar.lua:/fluent-bit/etc/clasificar.lua:ro
+    restart: unless-stopped
+    networks:
+      - logs
+
+volumes:
+  bw-storage:
+  bw-ui-data:
+  bw-db-data:
+
+networks:
+  bw-universe:
+    name: bw-universe
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.20.30.0/24
+  bw-services:
+    name: bw-services
+  bw-db:
+    name: bw-db
+  # Red creada por el stack de reportería (levántalo primero)
+  logs:
+    name: waf-logs
+    external: true

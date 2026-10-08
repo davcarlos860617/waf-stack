@@ -1,0 +1,115 @@
+# =============================================================================
+#  REPORTERÍA: Loki (logs) + Grafana (dashboard) + Azure Blob Storage
+# =============================================================================
+#
+#  Fluent Bit (en el stack del WAF) -> Loki -> Azure Blob Storage
+#                                         \-> Grafana consulta a Loki
+#
+#  Se levanta ANTES que el WAF, porque crea la red "waf-logs" que usa
+#  Fluent Bit para enviar los logs.
+#
+#  Blob Storage:
+#    - Pruebas locales: Azurite (emulador oficial de Microsoft), se activa
+#      con COMPOSE_PROFILES=emulador en el .env
+#    - Azure real: deja COMPOSE_PROFILES vacío y pon la cadena de conexión
+#      de tu cuenta de almacenamiento en WAF_BLOB_CONNECTION_STRING
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Emulador de Azure Blob Storage (solo con el perfil "emulador")
+  # ---------------------------------------------------------------------------
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:${AZURITE_VERSION}
+    container_name: rep-azurite
+    profiles: ["emulador"]
+    command: >
+      azurite-blob --blobHost 0.0.0.0 --blobPort 10000
+      --location /data --skipApiVersionCheck --loose
+    ports:
+      # Solo en localhost: para revisar los blobs con Azure Storage Explorer
+      - "127.0.0.1:10000:10000"
+    volumes:
+      - azurite-data:/data
+    restart: unless-stopped
+    networks:
+      - logs
+
+  # ---------------------------------------------------------------------------
+  # Crea el contenedor del Blob (Loki exige que exista) y termina.
+  # ---------------------------------------------------------------------------
+  blob-init:
+    image: python:${PYTHON_VERSION}
+    container_name: rep-blob-init
+    command: ["python", "-I", "/app/crear_contenedor.py"]
+    environment:
+      AZURE_STORAGE_CONNECTION_STRING: "${WAF_BLOB_CONNECTION_STRING}"
+      AZURE_CONTAINER: "${WAF_BLOB_CONTAINER}"
+    volumes:
+      - ./blob/crear_contenedor.py:/app/crear_contenedor.py:ro
+    depends_on:
+      azurite:
+        condition: service_started
+        required: false        # con Azure real, azurite no existe
+    restart: "no"
+    networks:
+      - logs
+
+  # ---------------------------------------------------------------------------
+  # Base de datos de logs. Guarda los logs en el Blob; el volumen local
+  # solo tiene datos temporales (WAL y cachés).
+  # ---------------------------------------------------------------------------
+  loki:
+    image: grafana/loki:${LOKI_VERSION}
+    container_name: rep-loki
+    command: -config.file=/etc/loki/loki.yaml -config.expand-env=true
+    environment:
+      AZURE_STORAGE_CONNECTION_STRING: "${WAF_BLOB_CONNECTION_STRING}"
+      AZURE_CONTAINER: "${WAF_BLOB_CONTAINER}"
+    volumes:
+      - ./loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    depends_on:
+      blob-init:
+        condition: service_completed_successfully
+    # Al detenerse, Loki sube al Blob lo que tenga pendiente: dale tiempo.
+    stop_grace_period: 1m
+    restart: unless-stopped
+    networks:
+      - logs
+
+  # ---------------------------------------------------------------------------
+  # Visualización
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:${GRAFANA_VERSION}
+    container_name: rep-grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      TZ: "${TZ}"
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: "/etc/grafana/dashboards/waf-bunkerweb.json"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - loki
+    restart: unless-stopped
+    networks:
+      - logs
+
+volumes:
+  azurite-data:
+  loki-data:
+  grafana-data:
+
+networks:
+  # Red compartida con el stack del WAF (Fluent Bit la usa para llegar a Loki)
+  logs:
+    name: waf-logs
