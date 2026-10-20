@@ -43,6 +43,10 @@ services:
       <<: *bw-api-env
     depends_on:
       - fluent-bit
+    # Permite proteger una aplicación que corre en esta misma máquina, fuera
+    # de Docker:  APP_UPSTREAM=http://host.docker.internal:PUERTO
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     logging: *logging-fluentbit
     restart: unless-stopped
     networks:
@@ -66,7 +70,18 @@ services:
       SERVER_NAME: "${APP_DOMAIN}"
       USE_REVERSE_PROXY: "yes"
       REVERSE_PROXY_URL: "/"
+      # A dónde se reenvía el tráfico limpio. Puede ser un contenedor de este
+      # compose, otra máquina, App Service o cualquier URL alcanzable.
       REVERSE_PROXY_HOST: "${APP_UPSTREAM}"
+      # Nombre de host que se envía a la aplicación. Vacío = el dominio del
+      # WAF. Para App Service u otros servicios que identifican la app por su
+      # nombre, pon aquí ese nombre (ej. miapp.azurewebsites.net).
+      REVERSE_PROXY_CUSTOM_HOST: "${APP_UPSTREAM_HOST:-}"
+      # SNI hacia la aplicación cuando es HTTPS (necesario en App Service).
+      REVERSE_PROXY_SSL_SNI: "${APP_UPSTREAM_SNI:-no}"
+      REVERSE_PROXY_SSL_SNI_NAME: "${APP_UPSTREAM_HOST:-}"
+      # Tiempo máximo esperando a la aplicación (súbelo si es lenta)
+      REVERSE_PROXY_READ_TIMEOUT: "${APP_UPSTREAM_TIMEOUT:-60s}"
 
       # --- HTTPS -------------------------------------------------------------
       AUTO_LETS_ENCRYPT: "${AUTO_LETS_ENCRYPT}"
@@ -145,13 +160,14 @@ services:
       - bw-db
 
   # ---------------------------------------------------------------------------
-  # Tu aplicación (aquí una app de demostración que responde con los datos de
-  # la petición). Cámbiala por la tuya. NO publica puertos: solo es
-  # accesible a través de BunkerWeb.
+  # Aplicación de demostración (responde con los datos de la petición).
+  # Solo arranca con el perfil "demo" (COMPOSE_PROFILES=demo en el .env).
+  # En una VM que protege una aplicación externa, deja el perfil vacío.
   # ---------------------------------------------------------------------------
   app:
     image: traefik/whoami:v1.10
     container_name: waf-app
+    profiles: ["demo"]
     restart: unless-stopped
     networks:
       - bw-services

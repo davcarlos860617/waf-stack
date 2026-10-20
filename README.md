@@ -102,7 +102,7 @@ Deberías ver `200` en las peticiones normales y `403` en los ataques. Con la op
 
 ## Logs en Azure Blob Storage
 
-Loki guarda los logs y su índice en un contenedor de Blob Storage (`AZURE_CONTAINER`, por defecto `loki-logs`). En el disco local de Loki solo queda lo temporal: los logs de los últimos minutos que aún no se han subido (protegidos por un registro de escritura, el WAL) y cachés.
+Loki guarda los logs y su índice en un contenedor de Blob Storage (`WAF_BLOB_CONTAINER`, por defecto `loki-logs`). En el disco local de Loki solo queda lo temporal: los logs de los últimos minutos que aún no se han subido (protegidos por un registro de escritura, el WAL) y cachés.
 
 - Un bloque de logs se sube al Blob tras **5 minutos sin líneas nuevas**, o como máximo cada hora.
 - El índice se sube en ciclos de unos 15 minutos y siempre al detener Loki.
@@ -125,7 +125,7 @@ Por defecto (`COMPOSE_PROFILES=emulador` en `reporteria/.env`) se usa **Azurite*
 3. En `reporteria/.env`, comenta las dos líneas de la opción A y descomenta las de la opción B:
    ```
    COMPOSE_PROFILES=
-   AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net
+   WAF_BLOB_CONNECTION_STRING=DefaultEndpointsProtocol=https;AccountName=...;AccountKey=...;EndpointSuffix=core.windows.net
    ```
 4. Desde `reporteria/`:
    ```powershell
@@ -187,9 +187,80 @@ En <http://localhost:7000> ves el estado de la instancia, el servicio protegido 
 
 ## Proteger tu propia aplicación
 
-1. Sustituye el servicio `app` de `docker-compose.yml` por el tuyo (`image:` o `build:`). Mantén `networks: [bw-services]` y **no** le pongas `ports:`.
-2. Ajusta `APP_UPSTREAM` en `.env`, por ejemplo `http://miapp:3000`.
-3. `docker compose up -d`.
+BunkerWeb puede reenviar el tráfico a una aplicación **en cualquier lugar**, no solo a un contenedor de este compose. Se configura en el `.env` del WAF:
+
+| Dónde está tu aplicación | `COMPOSE_PROFILES` | `APP_UPSTREAM` | `APP_UPSTREAM_HOST` | `APP_UPSTREAM_SNI` |
+|---|---|---|---|---|
+| Demo whoami (por defecto) | `demo` | `http://app:80` | *(vacío)* | `no` |
+| Contenedor tuyo en este compose | *(vacío)* | `http://miapp:3000` | *(vacío)* | `no` |
+| Azure App Service | *(vacío)* | `https://miapp.azurewebsites.net` | `miapp.azurewebsites.net` | `yes` |
+| Otro servidor / VM (IP privada o pública) | *(vacío)* | `http://10.0.0.5:8080` | *(vacío, o su dominio si lo exige)* | `no` |
+| La misma máquina, fuera de Docker | *(vacío)* | `http://host.docker.internal:3000` | *(vacío)* | `no` |
+
+- `APP_UPSTREAM_HOST` cambia la cabecera `Host` que llega a la aplicación. App Service (y casi cualquier hosting compartido) identifica la app por ese nombre; sin él responde 404.
+- `APP_UPSTREAM_SNI=yes` es necesario cuando la aplicación es HTTPS en un servicio compartido.
+- Para que nadie se salte el WAF, la aplicación debe **aceptar tráfico solo desde la IP del WAF** (App Service: *Networking → Access restrictions*; otra VM: su firewall/NSG).
+- Para un contenedor propio en este compose: añádelo con `networks: [bw-services]` y **sin** `ports:`.
+
+Después: `docker compose up -d`.
+
+## Desplegar en una VM Linux (solo WAF + reportería)
+
+La VM contiene BunkerWeb y toda la reportería (Fluent Bit, Loki, Grafana y Azurite o Azure Blob), todo en Docker. La aplicación vive en otro sitio.
+
+```
+Internet ──443──► VM Linux (Docker)                         ┌──► App Service / otra VM / ...
+                  ├─ BunkerWeb ─────── tráfico limpio ──────┘
+                  ├─ Fluent Bit ─► Loki ─► Blob (Azurite o Azure)
+                  └─ Grafana / UI BunkerWeb (solo por túnel SSH)
+```
+
+**1. Crear la VM.** Ubuntu Server 24.04, mínimo 2 vCPU y 4 GB de RAM (en Azure, p. ej. `Standard_B2s`; con 2 GB funciona usando la swap que crea el instalador, pero lento). Abre en el NSG/firewall solo **22 (desde tu IP), 80 y 443**. Si vas a usar Let's Encrypt, apunta un dominio a la IP pública (en Azure sirve la etiqueta DNS gratuita: `miwaf.eastus.cloudapp.azure.com`).
+
+**2. Copiar el proyecto e instalar.**
+```bash
+ssh usuario@IP_DE_LA_VM
+git clone https://github.com/davcarlos860617/waf-stack.git
+cd waf-stack
+sudo bash vm/instalar.sh
+exit            # vuelve a entrar para usar docker sin sudo
+```
+El instalador pone Docker, el firewall (ufw: 22, 80, 443), swap si hace falta y crea los `.env` si no existen.
+
+**3. Configurar el WAF** (`nano .env`):
+```ini
+APP_DOMAIN=miwaf.eastus.cloudapp.azure.com
+AUTO_LETS_ENCRYPT=yes
+GENERATE_SELF_SIGNED_SSL=no
+EMAIL_LETS_ENCRYPT=tu-correo@universidad.edu.co
+
+COMPOSE_PROFILES=
+APP_UPSTREAM=https://miapp.azurewebsites.net
+APP_UPSTREAM_HOST=miapp.azurewebsites.net
+APP_UPSTREAM_SNI=yes
+```
+Cambia también `BW_UI_ADMIN_PASSWORD` y `BW_DB_PASSWORD`. `LOKI_HOST`/`LOKI_PORT` se dejan igual (todo está en la misma VM).
+
+**4. Configurar la reportería** (`nano reporteria/.env`): clave de Grafana y elige Azurite (opción A, logs en el disco de la VM) o Azure Blob real (opción B, los logs sobreviven aunque borres la VM).
+
+**5. Arrancar.**
+```bash
+bash vm/stack.sh up          # reportería y luego WAF
+bash vm/stack.sh status
+bash vm/stack.sh logs bunkerweb
+```
+
+**6. Probar** desde tu PC: `.\pruebas.ps1 -Dominio miwaf.eastus.cloudapp.azure.com -IP IP_DE_LA_VM` (o `./pruebas.sh miwaf.eastus.cloudapp.azure.com IP_DE_LA_VM` en Linux).
+
+**7. Ver Grafana y la interfaz de BunkerWeb** con un túnel SSH (no abras 3000 ni 7000):
+```bash
+ssh -L 3000:localhost:3000 -L 7000:localhost:7000 usuario@IP_DE_LA_VM
+```
+Y abre `http://localhost:3000` y `http://localhost:7000` en tu navegador.
+
+**8. Cerrar la puerta trasera.** Restringe la aplicación para que solo acepte la IP pública de la VM. En App Service: *Networking → Access restrictions → Add rule → IPv4 `IP_DE_LA_VM/32`*. Comprueba que la URL directa de la app devuelve 403 y que por el dominio del WAF funciona.
+
+Actualizar en la VM tras cambios en el repositorio: `git pull && bash vm/stack.sh up`.
 
 ## Pasar a un servidor con dominio
 
@@ -213,6 +284,7 @@ En <http://localhost:7000> ves el estado de la instancia, el servicio protegido 
 | Síntoma | Causa probable y solución |
 |---|---|
 | Al levantar el WAF: `network waf-logs declared as external, but could not be found` | No has levantado la reportería. Ve a `reporteria/` y ejecuta `docker compose up -d` primero. |
+| `blob-init` intenta conectarse a una cuenta que no es la del `.env` | Tienes en Windows una variable de entorno con el mismo nombre; las del sistema tienen prioridad sobre el `.env`. Por eso el proyecto usa nombres con prefijo `WAF_`. Comprueba con `docker compose config` qué valor está usando. |
 | `blob-init` termina con error | Mira `docker compose logs blob-init` (en `reporteria/`). Con Azure real, revisa la cadena de conexión. |
 | `loki` no arranca | `docker compose logs loki` en `reporteria/`. Si cambiaste `loki.yaml`, no escribas `${...}` ni siquiera en comentarios. |
 | Grafana dice *No data* | Revisa `docker compose logs fluent-bit` (en la raíz) y `docker compose logs loki` (en `reporteria/`). |
@@ -243,6 +315,9 @@ waf-stack/
 ├── docker-compose.yml             # stack WAF
 ├── .env.example
 ├── pruebas.sh / pruebas.ps1       # pruebas de ataques (Linux / Windows)
+├── vm/
+│   ├── instalar.sh                # prepara una VM Linux (Docker, firewall, .env)
+│   └── stack.sh                   # up/down/status/logs de los dos stacks en orden
 ├── fluent-bit/
 │   ├── fluent-bit.conf            # entrada forward → filtro Lua → salida Loki
 │   └── clasificar.lua             # etiquetas tipo y contenedor
